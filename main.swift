@@ -1,5 +1,5 @@
 // SnapStrip：拖动窗口时，屏幕顶部出现一条提示细条；把窗口拖到屏幕上三分之一
-// 区域，条展开成一排布局格（左半、右半、四个角、最大化）；拖到某格上放开，
+// 区域，条展开成一排布局格（左半、右半、四个角、居中、最大化）；拖到某格上放开，
 // 窗口就贴到那个布局。
 // 只做这一件事：无菜单、无设置、无 Dock 图标。移动别人的窗口靠「辅助功能」
 // 权限（AXUIElement），拖动检测靠全局鼠标事件监听。
@@ -17,6 +17,7 @@ struct Layout {
         Layout(x: 0.5, y: 0.5, w: 0.5, h: 0.5), // 右上
         Layout(x: 0,   y: 0,   w: 0.5, h: 0.5), // 左下
         Layout(x: 0.5, y: 0,   w: 0.5, h: 0.5), // 右下
+        Layout(x: 0.25, y: 0.25, w: 0.5, h: 0.5), // 居中（宽高各半、面积为屏幕四分之一，四边留白对称）
         Layout(x: 0,   y: 0,   w: 1,   h: 1),   // 最大化
     ]
 }
@@ -99,6 +100,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var stripVisible = false
     private var expanded = false
     private var dragScreen: NSScreen?
+    private var downAppName = ""     // 按下时命中窗口所属应用（诊断日志用）
+    private var titlebarOK = false   // 按下点是否在标题栏区（诊断日志用）
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)  // 只在后台待命，不占 Dock、不抢焦点
@@ -156,7 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         version.alignment = .center
         let desc = NSTextField(wrappingLabelWithString: "拖动任意窗口时，顶部会出现提示条；把窗口拖到屏幕上三分之一，展开布局列表；拖到某个布局上放开，窗口就会贴到那个布局。")
         desc.alignment = .center
-        let keywords = NSTextField(labelWithString: "左半 · 右半 · 左上 · 右上 · 左下 · 右下 · 最大化")
+        let keywords = NSTextField(labelWithString: "左半 · 右半 · 左上 · 右上 · 左下 · 右下 · 居中 · 最大化")
         keywords.font = .systemFont(ofSize: 12)
         keywords.textColor = .secondaryLabelColor
         keywords.alignment = .center
@@ -336,11 +339,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - 拖动状态机
 
-    // 按下：命中某个窗口的标题栏区域（窗口顶部 40px）才记为「可能在拖这个窗口」
+    // 按下：命中某个窗口、且按下点在该窗口范围内才记为「可能在拖这个窗口」。
+    // 不再硬卡「顶部 40px 标题栏区」：微信、LocalSend 这类自绘窗口能拖动的
+    // 区域不止标题栏；是不是真在拖，由拖动中「原点是否真的变了」判定
     private func mouseDown() {
         resetDrag()
         let point = NSEvent.mouseLocation
-        guard let window = windowAt(point: point), isTitlebarArea(window, cocoaPoint: point) else { return }
+        guard let window = windowAt(point: point) else {
+            let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+            if front != "SnapStrip" { log("按下未命中窗口：前台=\(front)") }
+            return
+        }
+        var pid: pid_t = 0
+        AXUIElementGetPid(window, &pid)
+        downAppName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "未知应用"
+        titlebarOK = isTitlebarArea(window, cocoaPoint: point)
+        if !titlebarOK {
+            guard isInsideWindow(window, cocoaPoint: point) else { return }
+            log("按下（非标题栏区）：\(downAppName)")
+        }
         dragWindow = window
         startOrigin = axPoint(window, kAXPositionAttribute) ?? .zero
     }
@@ -360,6 +377,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 抢在它前面写位置会被它覆盖；写完再读回校验，没贴上就补写一次。
     private func mouseUp() {
         defer { resetDrag() }
+        if !stripVisible, let window = dragWindow,
+           let end = axPoint(window, kAXPositionAttribute), end != startOrigin {
+            // 全程没亮条、但放开时发现窗口确实移动了：有些自绘窗口拖动途中
+            // 不更新 AX 位置、到放开才跳变。光标若在屏幕上三分之一，
+            // 直接按展开状态补判一次落格，别让这次拖动白费
+            showStrip()
+            if mouseInTopThird() {
+                expanded = true
+                stripView.expanded = true
+                placeStrip(expanded: true, animate: false)
+                log("放开补判：\(downAppName) 标题栏区=\(titlebarOK)")
+            }
+        }
         guard stripVisible else { return }
         updateHover()  // 先按放开瞬间的位置刷新一次展开/悬停状态，免得快速拖放漏判
         guard expanded, let window = dragWindow,
@@ -517,22 +547,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // 元素本身是窗口（role 为 kAXWindowRole）才返回它，否则 nil
+    private func asWindow(_ element: AXUIElement) -> AXUIElement? {
+        var roleRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+              (roleRef as? String) == (kAXWindowRole as String) else { return nil }
+        return element
+    }
+
     private func windowAt(point: NSPoint) -> AXUIElement? {
         let axPoint = CGPoint(x: point.x, y: mainScreenHeight - point.y)
         var element: AXUIElement?
         guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(),
                                                Float(axPoint.x), Float(axPoint.y),
                                                &element) == .success,
-              let element = element else { return nil }
+              let hit = element else { return nil }
+        // 常规路径：命中元素直接报出所属窗口
         var windowRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &windowRef) == .success,
-              let windowRef = windowRef else { return nil }
-        let window = windowRef as! AXUIElement
-        var roleRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(window, kAXRoleAttribute as CFString, &roleRef) == .success,
-              (roleRef as? String) == (kAXWindowRole as String) else { return nil }
-        // 不可移动的窗口不用另查：拖不动时原点不变，后面自然不会亮条
-        return window
+        if AXUIElementCopyAttributeValue(hit, kAXWindowAttribute as CFString, &windowRef) == .success,
+           let windowRef = windowRef, let window = asWindow(windowRef as! AXUIElement) {
+            return window
+        }
+        // 自绘窗口（微信、Flutter 等）的命中元素常问不到所属窗口：
+        // 沿父链往上找 role 为窗口的元素
+        var current = hit
+        for _ in 0..<15 {
+            var parentRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parentRef) == .success,
+                  let parentRef = parentRef else { break }
+            let parent = parentRef as! AXUIElement
+            if let window = asWindow(parent) { return window }
+            current = parent
+        }
+        // 再兜底：取该应用当前聚焦（或主）窗口；按下点在不在它范围内，
+        // 由 mouseDown 的范围判定把关，不会误认别的窗口
+        var pid: pid_t = 0
+        AXUIElementGetPid(hit, &pid)
+        guard pid > 0 else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        for attribute in [kAXFocusedWindowAttribute, kAXMainWindowAttribute] {
+            var ref: CFTypeRef?
+            if AXUIElementCopyAttributeValue(app, attribute as CFString, &ref) == .success,
+               let ref = ref, let window = asWindow(ref as! AXUIElement) {
+                return window
+            }
+        }
+        return nil
+    }
+
+    // 点是否落在窗口范围内（标题栏判定的放宽版：整个窗口都算）
+    private func isInsideWindow(_ window: AXUIElement, cocoaPoint: NSPoint) -> Bool {
+        guard let pos = axPoint(window, kAXPositionAttribute),
+              let size = axSize(window, kAXSizeAttribute) else { return false }
+        let axY = mainScreenHeight - cocoaPoint.y
+        return cocoaPoint.x >= pos.x && cocoaPoint.x <= pos.x + size.width
+            && axY >= pos.y && axY <= pos.y + size.height
     }
 
     // 点是否落在窗口的标题栏拖动区：窗口左右范围内、距窗口顶边 40px 内

@@ -5,11 +5,13 @@
 A tiny macOS window-tiling utility in the spirit of the Windows 11
 snap bar. (Windows has this built in, so this is Mac-only.) Drag any
 window and a hint bar appears at the top of the screen; keep dragging
-into the top third and it expands into seven layouts — left half,
-right half, four corners, maximize — placed safely below the notch.
+into the top third and it expands into eight layouts — left half,
+right half, four corners, a centered window, maximize — placed safely below the notch.
 Drop the window on a layout and it moves and resizes to fit.
 
-- **Seven layouts:** left / right half, four quarter corners, maximize.
+- **Eight layouts:** left / right half, four quarter corners, a
+  centered window (half the width and height — a quarter of the
+  screen), maximize.
 - **Two-stage bar:** a slim hint bar, half the screen wide, appears as
   soon as a window starts moving; the full layout strip appears when
   the window or the cursor reaches the top third of the screen.
